@@ -19,7 +19,6 @@ const bookmarkSchema = new mongoose.Schema({
 
     cover:{
         type: String,
-        required: true
     }
 
 

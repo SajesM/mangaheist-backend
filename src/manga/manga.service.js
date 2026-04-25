@@ -48,9 +48,13 @@ const getMangaChapters = async (mangaId) => {
 };
 
 const getMangaPages = async (chapterId) => {
-    const res = await fetch(`${base_url}/at-home/server/${chapterId}`);
-    const data = await res.json();
-    return data.chapter.data.map((file) => `${data.baseUrl}/data/${data.chapter.hash}/${file}`);
+  const res = await fetch(`${base_url}/at-home/server/${chapterId}`);
+  const data = await res.json();
+
+  const base = data.baseUrl;
+  const hash = data.chapter.hash;
+
+  return data.chapter.data.map((file) => `${base}/data/${hash}/${file}`);
 };
 
 const getMangaById = async (mangaId) => {
