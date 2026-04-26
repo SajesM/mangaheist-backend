@@ -19,6 +19,32 @@ app.use(express.json());
 
 connectDb();
 
+const https = require('node:https');
+
+//added new for manga fixing
+app.get('/proxy-image', (req, res) => {
+    const imageUrl = req.query.url;
+
+    if (!imageUrl) return res.status(400).send('URL is required');
+
+    // Fetch image from MangaDex
+    https.get(imageUrl, {
+        headers: { 
+            // MangaDex requires a User-Agent header
+            'User-Agent': 'MyMangaApp/1.0.0' 
+        }
+    }, (proxyRes) => {
+        // Forward the content type (image/jpeg, image/png, etc.)
+        res.setHeader('Content-Type', proxyRes.headers['content-type']);
+        
+        // Stream the image data directly to the frontend
+        proxyRes.pipe(res);
+    }).on('error', (err) => {
+        console.error('Proxy Error:', err.message);
+        res.status(500).send('Failed to fetch image');
+    });
+});
+
 app.use("/api/user", userRoute);
 app.use("/api/bookmark", bookmarkRoute);
 app.use("/api/manga", mangaRoute);

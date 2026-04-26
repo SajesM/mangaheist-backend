@@ -47,10 +47,18 @@ const getMangaChapters = async (mangaId) => {
     return res.json();
 };
 
+// updated
 const getMangaPages = async (chapterId) => {
     const res = await fetch(`${base_url}/at-home/server/${chapterId}`);
     const data = await res.json();
-    return data.chapter.data.map((file) => `${data.baseUrl}/data/${data.chapter.hash}/${file}`);
+    
+    return data.chapter.data.map((file) => {
+        const directUrl = `${data.baseUrl}/data/${data.chapter.hash}/${file}`;
+        
+        // Point to your live backend's proxy route
+        // Use a relative path if your frontend and backend are on the same domain
+        return `/proxy-image?url=${encodeURIComponent(directUrl)}`;
+    });
 };
 
 const getMangaById = async (mangaId) => {
