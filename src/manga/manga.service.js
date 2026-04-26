@@ -1,3 +1,4 @@
+const axios = require('axios');
 const base_url = "https://api.mangadex.org";
 
 // ─── In-memory caches ──────────────────────────────────────────────────────────
@@ -10,37 +11,54 @@ const BASE_URL_TTL = 10 * 60 * 1000; // 10 min – @Home CDN node URLs expire fa
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Browser-like headers to avoid Cloudflare datacenter IP blocks
+const MANGADEX_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Origin': 'https://mangadex.org',
+    'Referer': 'https://mangadex.org/',
+};
+
 /**
- * Fetch with timeout + exponential-backoff retry.
- * Handles 429 rate-limits and transient network errors.
+ * Axios-based fetch with timeout + exponential-backoff retry.
+ * Uses Node's native https module (different TLS fingerprint from undici)
+ * which bypasses Cloudflare's datacenter IP detection on Render.
  */
 const fetchWithRetry = async (url, retries = 3, delay = 2000) => {
     for (let i = 0; i < retries; i++) {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 12000); // 12 s per attempt
-
         try {
-            const res = await fetch(url, {
-                headers: { 'User-Agent': 'MangaHiest-App/1.0' },
-                signal: controller.signal,
+            const response = await axios.get(url, {
+                headers: MANGADEX_HEADERS,
+                timeout: 12000,
+                validateStatus: null, // don't throw on non-2xx, handle manually
             });
-            clearTimeout(timer);
 
-            if (res.ok) return res;
+            // Wrap in a response-like object so all callers work unchanged
+            const ok = response.status >= 200 && response.status < 300;
+            const fakeRes = {
+                ok,
+                status: response.status,
+                statusText: response.statusText,
+                json: async () => response.data,
+            };
 
-            if (res.status === 429) {
+            if (ok) return fakeRes;
+
+            if (response.status === 429) {
                 console.warn(`[MangaDex] 429 Rate-limit hit, waiting ${delay}ms… (attempt ${i + 1}/${retries})`);
                 await sleep(delay);
-                delay *= 2; // exponential backoff
+                delay *= 2;
                 continue;
             }
 
-            // Non-retriable error – return it so the caller can handle it
-            return res;
+            // Non-retriable HTTP error – return so caller can handle it
+            return fakeRes;
 
         } catch (err) {
-            clearTimeout(timer);
-            const label = err.name === 'AbortError' ? 'Timeout' : err.message;
+            const label = err.code === 'ECONNABORTED' ? 'Timeout'
+                        : err.code ? err.code
+                        : err.message;
             console.warn(`[fetchWithRetry] ${label} on attempt ${i + 1}/${retries}: ${url}`);
 
             if (i < retries - 1) {
