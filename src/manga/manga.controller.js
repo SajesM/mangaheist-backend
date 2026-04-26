@@ -56,7 +56,12 @@ const getCover = async (req, res) => {
         const { mangaId, fileName } = req.params;
         let response;
         for (let i = 0; i < 3; i++) {
-            response = await fetch(`https://uploads.mangadex.org/covers/${mangaId}/${fileName}`);
+            response = await fetch(`https://uploads.mangadex.org/covers/${mangaId}/${fileName}`, {
+                headers: {
+                    'User-Agent': 'MangaHiest-App/1.0',
+                    'Referer': 'https://mangadex.org/'
+                }
+            });
             if (response.ok) break;
             if (response.status === 429) {
                 await new Promise(resolve => setTimeout(resolve, 1500 * (i + 1))); // Simple backoff
@@ -65,12 +70,22 @@ const getCover = async (req, res) => {
             break;
         }
         
-        if (!response || !response.ok) return res.status(404).send('Not found');
+        if (!response || !response.ok) {
+            console.error(`Failed to fetch cover ${fileName}, status: ${response ? response.status : 'unknown'}`);
+            return res.status(404).send('Not found');
+        }
         
-        res.setHeader('Content-Type', response.headers.get('content-type'));
+        const contentType = response.headers.get('content-type');
+        if (contentType) {
+            res.setHeader('Content-Type', contentType);
+        }
+        
         const arrayBuffer = await response.arrayBuffer();
         res.send(Buffer.from(arrayBuffer));
-    } catch (error) { res.status(500).send('Error proxying image'); }
+    } catch (error) { 
+        console.error("Error proxying cover image:", error);
+        res.status(500).json({ message: 'Error proxying image', error: error.message }); 
+    }
 };
 
 const getPage = async (req, res) => {
@@ -78,7 +93,12 @@ const getPage = async (req, res) => {
         const { hash, fileName } = req.params;
         let response;
         for (let i = 0; i < 3; i++) {
-            response = await fetch(`https://uploads.mangadex.org/data/${hash}/${fileName}`);
+            response = await fetch(`https://uploads.mangadex.org/data/${hash}/${fileName}`, {
+                headers: {
+                    'User-Agent': 'MangaHiest-App/1.0',
+                    'Referer': 'https://mangadex.org/'
+                }
+            });
             if (response.ok) break;
             if (response.status === 429) {
                 await new Promise(resolve => setTimeout(resolve, 1500 * (i + 1)));
@@ -87,12 +107,22 @@ const getPage = async (req, res) => {
             break;
         }
         
-        if (!response || !response.ok) return res.status(404).send('Not found');
+        if (!response || !response.ok) {
+            console.error(`Failed to fetch page ${fileName}, status: ${response ? response.status : 'unknown'}`);
+            return res.status(404).send('Not found');
+        }
         
-        res.setHeader('Content-Type', response.headers.get('content-type'));
+        const contentType = response.headers.get('content-type');
+        if (contentType) {
+            res.setHeader('Content-Type', contentType);
+        }
+        
         const arrayBuffer = await response.arrayBuffer();
         res.send(Buffer.from(arrayBuffer));
-    } catch (error) { res.status(500).send('Error proxying page'); }
+    } catch (error) { 
+        console.error("Error proxying page:", error);
+        res.status(500).json({ message: 'Error proxying page', error: error.message }); 
+    }
 };
 
 module.exports = { getTrending, getLatest, getList, search, getChapters, getPages, getManga, getCover, getPage };

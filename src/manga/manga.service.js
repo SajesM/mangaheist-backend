@@ -8,7 +8,11 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const fetchWithRetry = async (url, retries = 3, delay = 2000) => {
     for (let i = 0; i < retries; i++) {
-        const res = await fetch(url);
+        const res = await fetch(url, {
+            headers: {
+                'User-Agent': 'MangaHiest-App/1.0',
+            }
+        });
         if (res.ok) return res;
         if (res.status === 429) {
             console.warn(`MangaDex Rate limit hit (429), retrying in ${delay}ms...`);
