@@ -1,26 +1,24 @@
 const mangaService = require("./manga.service");
-const pLimit = require("p-limit");
 
-const limit = pLimit(5); // limit concurrent requests
-const cache = new Map(); // simple in-memory cache
-
-// ================= BASIC CONTROLLERS =================
+// ─── Simple manga data endpoints ───────────────────────────────────────────────
 
 const getTrending = async (req, res) => {
     try {
         const data = await mangaService.getTrending();
         res.json(data);
     } catch (error) {
-        res.status(500).json({ message: "Mangadex error", error: error.message });
+        console.error("[getTrending]", error.message);
+        res.status(500).json({ message: "Failed to fetch trending manga", error: error.message });
     }
 };
 
 const getList = async (req, res) => {
     try {
-        const limitQuery = req.query.limit || 20;
-        const data = await mangaService.getListOfManga(limitQuery);
+        const limit = req.query.limit || 20;
+        const data = await mangaService.getListOfManga(limit);
         res.json(data);
     } catch (error) {
+        console.error("[getList]", error.message);
         res.status(500).json({ message: error.message });
     }
 };
@@ -30,6 +28,7 @@ const getLatest = async (req, res) => {
         const data = await mangaService.getLatestManga();
         res.json(data);
     } catch (error) {
+        console.error("[getLatest]", error.message);
         res.status(500).json({ message: error.message });
     }
 };
@@ -39,6 +38,7 @@ const search = async (req, res) => {
         const data = await mangaService.searchManga(req.query.title);
         res.json(data);
     } catch (error) {
+        console.error("[search]", error.message);
         res.status(500).json({ message: error.message });
     }
 };
@@ -48,6 +48,7 @@ const getChapters = async (req, res) => {
         const data = await mangaService.getMangaChapters(req.params.mangaId);
         res.json(data);
     } catch (error) {
+        console.error("[getChapters]", error.message);
         res.status(500).json({ message: error.message });
     }
 };
@@ -57,6 +58,7 @@ const getPages = async (req, res) => {
         const data = await mangaService.getMangaPages(req.params.chapterId);
         res.json(data);
     } catch (error) {
+        console.error("[getPages]", error.message);
         res.status(500).json({ message: error.message });
     }
 };
@@ -66,130 +68,147 @@ const getManga = async (req, res) => {
         const data = await mangaService.getMangaById(req.params.mangaId);
         res.json(data);
     } catch (error) {
+        console.error("[getManga]", error.message);
         res.status(500).json({ message: error.message });
     }
 };
 
-// ================= FIXED COVER PROXY =================
+// ─── Image proxy helpers ────────────────────────────────────────────────────────
 
-const getCover = async (req, res) => {
-    const { mangaId, fileName } = req.params;
-    const maxRetries = 2;
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    const finalFileName = fileName.includes(".256.")
-        ? fileName
-        : `${fileName}.256.jpg`;
-
-    const cacheKey = `${mangaId}-${finalFileName}`;
-
-    // ✅ Serve from cache
-    if (cache.has(cacheKey)) {
-        res.setHeader("Content-Type", "image/jpeg");
-        res.setHeader("Cache-Control", "public, max-age=86400");
-        return res.send(cache.get(cacheKey));
-    }
-
+/**
+ * Proxy an image URL through the backend.
+ * Retries up to maxRetries times with exponential backoff.
+ */
+const proxyImage = async (imageUrl, res, label) => {
+    const maxRetries = 3;
     let lastError = null;
+
+    // 30-second overall guard — prevents the request from hanging forever
+    const overallTimer = setTimeout(() => {
+        if (!res.headersSent) {
+            res.status(504).json({ message: "Gateway timeout proxying image" });
+        }
+    }, 30000);
 
     try {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            const controller = new AbortController();
+            const fetchTimer = setTimeout(() => controller.abort(), 15000);
+
             try {
-                const response = await limit(() =>
-                    fetch(`https://uploads.mangadex.org/covers/${mangaId}/${finalFileName}`, {
-                        headers: {
-                            "User-Agent": "MangaHiest-App/1.0",
-                            "Referer": "https://mangadex.org/",
-                            "Accept": "image/webp,image/*,*/*;q=0.8"
-                        }
-                    })
-                );
+                const response = await fetch(imageUrl, {
+                    headers: {
+                        "User-Agent":      "MangaHiest-App/1.0",
+                        "Referer":         "https://mangadex.org/",
+                        "Accept":          "image/webp,image/apng,image/*,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.9",
+                    },
+                    signal: controller.signal,
+                });
+                clearTimeout(fetchTimer);
 
                 if (response.ok) {
                     const contentType = response.headers.get("content-type") || "image/jpeg";
-                    const buffer = Buffer.from(await response.arrayBuffer());
-
-                    cache.set(cacheKey, buffer);
-
                     res.setHeader("Content-Type", contentType);
-                    res.setHeader(
-                        "Cache-Control",
-                        "public, max-age=86400, stale-while-revalidate=604800"
-                    );
-
-                    return res.send(buffer);
+                    res.setHeader("Cache-Control", "public, max-age=86400"); // 24 h
+                    const buf = await response.arrayBuffer();
+                    clearTimeout(overallTimer);
+                    return res.send(Buffer.from(buf));
                 }
 
+                // Rate-limited — back off and retry
                 if (response.status === 429) {
-                    const waitTime = 2000 * Math.pow(2, attempt);
-                    console.log(`Rate limited → wait ${waitTime}ms`);
-                    await new Promise(r => setTimeout(r, waitTime));
+                    const wait = 2000 * Math.pow(2, attempt - 1);
+                    console.warn(`[proxy] 429 on ${label}, waiting ${wait}ms (attempt ${attempt}/${maxRetries})`);
+                    await sleep(wait);
                     continue;
                 }
 
+                // Hard 4xx (except 429) — don't retry
                 if (response.status === 404) {
-                    return res.status(404).send("Cover not found");
+                    clearTimeout(overallTimer);
+                    return res.status(404).send("Image not found");
+                }
+                if (response.status >= 400 && response.status < 500) {
+                    clearTimeout(overallTimer);
+                    return res.status(response.status).send("Image not available");
                 }
 
-                if (response.status >= 500 && attempt < maxRetries) {
-                    await new Promise(r => setTimeout(r, 2000 * attempt));
+                // 5xx — retry after short delay
+                if (attempt < maxRetries) {
+                    const wait = 1000 * attempt;
+                    console.warn(`[proxy] ${response.status} on ${label}, retry ${attempt}/${maxRetries} after ${wait}ms`);
+                    await sleep(wait);
                 }
 
-            } catch (err) {
-                lastError = err;
+            } catch (fetchErr) {
+                clearTimeout(fetchTimer);
+                lastError = fetchErr;
 
-                if (err.cause?.code === "UND_ERR_SOCKET") {
-                    console.log("CDN closed connection — stop retry");
-                    break;
-                }
+                const isSocket = fetchErr.cause?.code === "UND_ERR_SOCKET" ||
+                                 fetchErr.message?.includes("other side closed");
+                const isAbort  = fetchErr.name === "AbortError";
 
-                if (err.name === "AbortError" && attempt < maxRetries) {
-                    await new Promise(r => setTimeout(r, 1000));
-                    continue;
-                }
+                console.warn(`[proxy] ${isAbort ? "Timeout" : isSocket ? "Socket error" : "Error"} on ${label} (attempt ${attempt}/${maxRetries}):`, fetchErr.message);
 
                 if (attempt < maxRetries) {
-                    await new Promise(r => setTimeout(r, 1000));
+                    await sleep(isSocket ? 2000 * attempt : 1000);
                 }
             }
         }
 
-        console.error(`Failed cover: ${finalFileName}`);
+        clearTimeout(overallTimer);
+        console.error(`[proxy] Failed to fetch ${label} after ${maxRetries} attempts`);
 
-        return res.status(502).json({
-            message: "Failed to fetch cover",
-            error: lastError?.message || "Unknown error"
-        });
+        if (!res.headersSent) {
+            res.status(502).json({
+                message: "Error proxying image",
+                error:   lastError?.message || "Failed after multiple retries",
+            });
+        }
 
-    } catch (error) {
-        console.error("Fatal error in getCover:", error);
-
-        return res.status(500).json({
-            message: "Internal error",
-            error: error.message
-        });
+    } catch (err) {
+        clearTimeout(overallTimer);
+        console.error(`[proxy] Fatal error for ${label}:`, err);
+        if (!res.headersSent) {
+            res.status(500).json({ message: "Internal proxy error", error: err.message });
+        }
     }
 };
 
-// ================= FIXED PAGE HANDLER =================
+// ─── Cover proxy ───────────────────────────────────────────────────────────────
 
-// ❗ DO NOT proxy images anymore
-// just return direct MangaDex URL
+const getCover = async (req, res) => {
+    const { mangaId, fileName } = req.params;
+    const url = `https://uploads.mangadex.org/covers/${mangaId}/${fileName}`;
+    await proxyImage(url, res, `cover/${fileName}`);
+};
+
+// ─── Page proxy ────────────────────────────────────────────────────────────────
 
 const getPage = async (req, res) => {
-    const { baseUrl, hash, fileName } = req.query;
+    const { hash, fileName } = req.params;
 
-    if (!baseUrl || !hash || !fileName) {
-        return res.status(400).json({
-            message: "Missing parameters"
-        });
+    // ✅ Use the dynamic CDN baseUrl cached when getPages was called.
+    // Falls back to uploads.mangadex.org when the server has just cold-started
+    // and the cache is empty (Render free tier wake-up scenario).
+    const cachedBase = mangaService.getBaseUrlForHash(hash);
+    const imageUrl   = cachedBase
+        ? `${cachedBase}/data/${hash}/${fileName}`
+        : `https://uploads.mangadex.org/data/${hash}/${fileName}`;
+
+    if (cachedBase) {
+        console.log(`[getPage] Using cached CDN node for hash ${hash.slice(0, 8)}…`);
+    } else {
+        console.warn(`[getPage] No cached baseUrl for hash ${hash.slice(0, 8)}… – falling back to uploads.mangadex.org`);
     }
 
-    const url = `${baseUrl}/data/${hash}/${fileName}`;
-
-    return res.json({ url });
+    await proxyImage(imageUrl, res, `page/${fileName}`);
 };
 
-// ================= EXPORT =================
+// ─── Exports ───────────────────────────────────────────────────────────────────
 
 module.exports = {
     getTrending,
@@ -200,5 +219,5 @@ module.exports = {
     getPages,
     getManga,
     getCover,
-    getPage
+    getPage,
 };

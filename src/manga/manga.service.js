@@ -1,87 +1,79 @@
-const pLimit = require("p-limit");
-
 const base_url = "https://api.mangadex.org";
-const limit = pLimit(5);
 
-const chapterCache = new Map();
-const CACHE_TTL = 15 * 60 * 1000;
+// ─── In-memory caches ──────────────────────────────────────────────────────────
+const chapterCache = new Map();   // chapterId → { timestamp, data: pages[] }
+const baseUrlCache = new Map();   // chapter hash → { timestamp, url }
 
+const CACHE_TTL = 15 * 60 * 1000; // 15 min – page list
+const BASE_URL_TTL = 10 * 60 * 1000; // 10 min – @Home CDN node URLs expire fast
+
+// ─── Helpers ───────────────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// ================= SAFE FETCH =================
+/**
+ * Fetch with timeout + exponential-backoff retry.
+ * Handles 429 rate-limits and transient network errors.
+ */
+const fetchWithRetry = async (url, retries = 3, delay = 2000) => {
+    for (let i = 0; i < retries; i++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 12000); // 12 s per attempt
 
-const fetchWithRetry = async (url, retries = 2, delay = 2000) => {
-    let lastError;
-
-    for (let i = 1; i <= retries; i++) {
         try {
-            const res = await limit(() =>
-                fetch(url, {
-                    headers: {
-                        'User-Agent': 'MangaHiest-App/1.0',
-                    }
-                })
-            );
+            const res = await fetch(url, {
+                headers: { 'User-Agent': 'MangaHiest-App/1.0' },
+                signal: controller.signal,
+            });
+            clearTimeout(timer);
 
             if (res.ok) return res;
 
             if (res.status === 429) {
-                const wait = delay * Math.pow(2, i);
-                console.warn(`429 rate limit → wait ${wait}ms`);
-                await sleep(wait);
+                console.warn(`[MangaDex] 429 Rate-limit hit, waiting ${delay}ms… (attempt ${i + 1}/${retries})`);
+                await sleep(delay);
+                delay *= 2; // exponential backoff
                 continue;
             }
 
+            // Non-retriable error – return it so the caller can handle it
             return res;
 
         } catch (err) {
-            lastError = err;
+            clearTimeout(timer);
+            const label = err.name === 'AbortError' ? 'Timeout' : err.message;
+            console.warn(`[fetchWithRetry] ${label} on attempt ${i + 1}/${retries}: ${url}`);
 
-            // 🚫 STOP retrying if socket closed
-            if (err.cause?.code === "UND_ERR_SOCKET") {
-                console.warn("Socket closed by MangaDex — stopping retries");
-                break;
-            }
-
-            if (i < retries) {
-                await sleep(1000);
+            if (i < retries - 1) {
+                await sleep(delay);
+                delay *= 1.5;
             }
         }
     }
-
-    throw new Error(lastError?.message || "Max retries reached");
+    throw new Error(`Failed to fetch after ${retries} retries: ${url}`);
 };
 
-// ================= CLEAN DATA =================
-
+// ─── Data transformers ─────────────────────────────────────────────────────────
 const cleanMangaData = (mangaList) => {
     if (!mangaList) return [];
-
     return mangaList.map(manga => {
-        const title =
-            manga.attributes?.title?.en ||
-            Object.values(manga.attributes?.title || {})[0] ||
-            "No Title";
-
-        const coverRel = manga.relationships?.find(rel => rel.type === "cover_art");
-
+        const title = manga.attributes?.title?.en || Object.values(manga.attributes?.title || {})[0] || 'No Title';
+        const coverRelationship = manga.relationships?.find(rel => rel.type === 'cover_art');
         return {
             id: manga.id,
             title,
-            coverFile: coverRel?.attributes?.fileName || null,
+            coverFile: coverRelationship?.attributes?.fileName ?? null,
             status: manga.attributes?.status,
             year: manga.attributes?.year,
             tags: manga.attributes?.tags || [],
             description:
                 manga.attributes?.description?.en ||
                 Object.values(manga.attributes?.description || {})[0] ||
-                "No description available."
+                'No description available.',
         };
     });
 };
 
-// ================= API FUNCTIONS =================
-
+// ─── Service functions ─────────────────────────────────────────────────────────
 const getTrending = async () => {
     const res = await fetchWithRetry(
         `${base_url}/manga?includes[]=cover_art&order[followedCount]=desc&limit=20&contentRating[]=safe&contentRating[]=suggestive`
@@ -91,9 +83,9 @@ const getTrending = async () => {
     return cleanMangaData(data.data);
 };
 
-const getListOfManga = async (limitNum) => {
+const getListOfManga = async (limit) => {
     const res = await fetchWithRetry(
-        `${base_url}/manga?limit=${limitNum}&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`
+        `${base_url}/manga?limit=${limit}&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`
     );
     if (!res.ok) return [];
     const data = await res.json();
@@ -126,49 +118,68 @@ const getMangaChapters = async (mangaId) => {
     return res.json();
 };
 
-// ================= IMPORTANT FIX =================
-
+/**
+ * Fetches the page list for a chapter from the MangaDex @Home API.
+ * Also caches the dynamic CDN baseUrl keyed by chapter hash so the
+ * getPage proxy can use the correct server instead of uploads.mangadex.org.
+ */
 const getMangaPages = async (chapterId) => {
+    // Return from cache if still fresh
     if (chapterCache.has(chapterId)) {
         const cached = chapterCache.get(chapterId);
         if (Date.now() - cached.timestamp < CACHE_TTL) {
             return cached.data;
-        } else {
-            chapterCache.delete(chapterId);
         }
+        chapterCache.delete(chapterId);
     }
 
     const res = await fetchWithRetry(`${base_url}/at-home/server/${chapterId}`);
-
     if (!res.ok) {
-        throw new Error(`MangaDex API error: ${res.status}`);
+        throw new Error(`MangaDex @Home API error: ${res.status} ${res.statusText}`);
     }
 
     const data = await res.json();
+    if (!data?.chapter?.data) {
+        throw new Error('Invalid response structure from MangaDex @Home API');
+    }
 
-    const result = {
-        baseUrl: data.baseUrl,
+    // ✅ Cache the dynamic baseUrl so getPage can use the right CDN node
+    if (data.baseUrl && data.chapter.hash) {
+        baseUrlCache.set(data.chapter.hash, {
+            url: data.baseUrl,
+            timestamp: Date.now(),
+        });
+        console.log(`[Cache] Stored baseUrl for hash ${data.chapter.hash.slice(0, 8)}…`);
+    }
+
+    const pages = data.chapter.data.map(file => ({
         hash: data.chapter.hash,
-        pages: data.chapter.data
-    };
+        file,
+    }));
 
-    chapterCache.set(chapterId, {
-        timestamp: Date.now(),
-        data: result
-    });
+    chapterCache.set(chapterId, { timestamp: Date.now(), data: pages });
+    return pages;
+};
 
-    return result;
+/**
+ * Returns the cached MangaDex @Home CDN baseUrl for a given chapter hash.
+ * Returns null when not cached or expired.
+ */
+const getBaseUrlForHash = (hash) => {
+    const cached = baseUrlCache.get(hash);
+    if (!cached) return null;
+    if (Date.now() - cached.timestamp > BASE_URL_TTL) {
+        baseUrlCache.delete(hash);
+        return null;
+    }
+    return cached.url;
 };
 
 const getMangaById = async (mangaId) => {
-    const res = await fetchWithRetry(
-        `${base_url}/manga/${mangaId}?includes[]=cover_art`
-    );
-    if (!res.ok) throw new Error("Failed to fetch manga");
-
+    const res = await fetchWithRetry(`${base_url}/manga/${mangaId}?includes[]=cover_art`);
+    if (!res.ok) throw new Error('Failed to fetch manga');
     const data = await res.json();
     if (!data.data) return null;
-
     return cleanMangaData([data.data])[0];
 };
 
@@ -179,5 +190,6 @@ module.exports = {
     searchManga,
     getMangaChapters,
     getMangaPages,
-    getMangaById
+    getMangaById,
+    getBaseUrlForHash, // ← exported so controller can look up cached CDN node
 };
