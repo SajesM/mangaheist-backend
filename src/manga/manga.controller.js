@@ -1,4 +1,5 @@
 const mangaService = require("./manga.service");
+const axios = require('axios');
 
 // ─── Simple manga data endpoints ───────────────────────────────────────────────
 
@@ -77,84 +78,81 @@ const getManga = async (req, res) => {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Browser-like headers for image proxy — avoids Cloudflare TLS block on Render
+const IMAGE_HEADERS = {
+    'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept':          'image/webp,image/apng,image/*,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer':         'https://mangadex.org/',
+};
+
 /**
- * Proxy an image URL through the backend.
- * Retries up to maxRetries times with exponential backoff.
+ * Proxy an image URL through the backend using axios.
+ * axios uses Node's native https module — different TLS fingerprint from undici,
+ * which avoids Cloudflare's datacenter IP block on Render free tier.
  */
 const proxyImage = async (imageUrl, res, label) => {
     const maxRetries = 3;
     let lastError = null;
 
-    // 30-second overall guard — prevents the request from hanging forever
+    // 30-second overall guard
     const overallTimer = setTimeout(() => {
         if (!res.headersSent) {
-            res.status(504).json({ message: "Gateway timeout proxying image" });
+            res.status(504).json({ message: 'Gateway timeout proxying image' });
         }
     }, 30000);
 
     try {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            const controller = new AbortController();
-            const fetchTimer = setTimeout(() => controller.abort(), 15000);
-
             try {
-                const response = await fetch(imageUrl, {
-                    headers: {
-                        "User-Agent":      "MangaHiest-App/1.0",
-                        "Referer":         "https://mangadex.org/",
-                        "Accept":          "image/webp,image/apng,image/*,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.9",
-                    },
-                    signal: controller.signal,
+                const response = await axios.get(imageUrl, {
+                    headers:        IMAGE_HEADERS,
+                    responseType:   'arraybuffer', // get raw bytes directly
+                    timeout:        15000,
+                    validateStatus: null,          // handle all status codes manually
                 });
-                clearTimeout(fetchTimer);
 
-                if (response.ok) {
-                    const contentType = response.headers.get("content-type") || "image/jpeg";
-                    res.setHeader("Content-Type", contentType);
-                    res.setHeader("Cache-Control", "public, max-age=86400"); // 24 h
-                    const buf = await response.arrayBuffer();
+                const status = response.status;
+
+                if (status >= 200 && status < 300) {
+                    const contentType = response.headers['content-type'] || 'image/jpeg';
+                    res.setHeader('Content-Type', contentType);
+                    res.setHeader('Cache-Control', 'public, max-age=86400'); // 24 h
                     clearTimeout(overallTimer);
-                    return res.send(Buffer.from(buf));
+                    return res.send(Buffer.from(response.data));
                 }
 
-                // Rate-limited — back off and retry
-                if (response.status === 429) {
+                if (status === 429) {
                     const wait = 2000 * Math.pow(2, attempt - 1);
                     console.warn(`[proxy] 429 on ${label}, waiting ${wait}ms (attempt ${attempt}/${maxRetries})`);
                     await sleep(wait);
                     continue;
                 }
 
-                // Hard 4xx (except 429) — don't retry
-                if (response.status === 404) {
+                if (status === 404) {
                     clearTimeout(overallTimer);
-                    return res.status(404).send("Image not found");
+                    return res.status(404).send('Image not found');
                 }
-                if (response.status >= 400 && response.status < 500) {
+                if (status >= 400 && status < 500) {
                     clearTimeout(overallTimer);
-                    return res.status(response.status).send("Image not available");
+                    return res.status(status).send('Image not available');
                 }
 
-                // 5xx — retry after short delay
+                // 5xx — retry
                 if (attempt < maxRetries) {
                     const wait = 1000 * attempt;
-                    console.warn(`[proxy] ${response.status} on ${label}, retry ${attempt}/${maxRetries} after ${wait}ms`);
+                    console.warn(`[proxy] ${status} on ${label}, retry ${attempt}/${maxRetries} after ${wait}ms`);
                     await sleep(wait);
                 }
 
-            } catch (fetchErr) {
-                clearTimeout(fetchTimer);
-                lastError = fetchErr;
-
-                const isSocket = fetchErr.cause?.code === "UND_ERR_SOCKET" ||
-                                 fetchErr.message?.includes("other side closed");
-                const isAbort  = fetchErr.name === "AbortError";
-
-                console.warn(`[proxy] ${isAbort ? "Timeout" : isSocket ? "Socket error" : "Error"} on ${label} (attempt ${attempt}/${maxRetries}):`, fetchErr.message);
+            } catch (axiosErr) {
+                lastError = axiosErr;
+                const isTimeout = axiosErr.code === 'ECONNABORTED';
+                const label2    = isTimeout ? 'Timeout' : (axiosErr.code || axiosErr.message);
+                console.warn(`[proxy] ${label2} on ${label} (attempt ${attempt}/${maxRetries}):`, axiosErr.message);
 
                 if (attempt < maxRetries) {
-                    await sleep(isSocket ? 2000 * attempt : 1000);
+                    await sleep(isTimeout ? 1000 : 2000 * attempt);
                 }
             }
         }
@@ -164,8 +162,8 @@ const proxyImage = async (imageUrl, res, label) => {
 
         if (!res.headersSent) {
             res.status(502).json({
-                message: "Error proxying image",
-                error:   lastError?.message || "Failed after multiple retries",
+                message: 'Error proxying image',
+                error:   lastError?.message || 'Failed after multiple retries',
             });
         }
 
@@ -173,7 +171,7 @@ const proxyImage = async (imageUrl, res, label) => {
         clearTimeout(overallTimer);
         console.error(`[proxy] Fatal error for ${label}:`, err);
         if (!res.headersSent) {
-            res.status(500).json({ message: "Internal proxy error", error: err.message });
+            res.status(500).json({ message: 'Internal proxy error', error: err.message });
         }
     }
 };
