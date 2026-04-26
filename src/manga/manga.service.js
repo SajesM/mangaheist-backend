@@ -1,6 +1,26 @@
 const base_url = "https://api.mangadex.org";
 const cover_url = "https://uploads.mangadex.org/covers";
 
+const chapterCache = new Map();
+const CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+const fetchWithRetry = async (url, retries = 3, delay = 2000) => {
+    for (let i = 0; i < retries; i++) {
+        const res = await fetch(url);
+        if (res.ok) return res;
+        if (res.status === 429) {
+            console.warn(`MangaDex Rate limit hit (429), retrying in ${delay}ms...`);
+            await sleep(delay);
+            delay *= 1.5; // exponential backoff
+            continue;
+        }
+        return res;
+    }
+    throw new Error("Max retries reached due to rate limit");
+};
+
 const cleanMangaData = (mangaList) => {
     if (!mangaList) return [];
     return mangaList.map(manga => {
@@ -48,9 +68,38 @@ const getMangaChapters = async (mangaId) => {
 };
 
 const getMangaPages = async (chapterId) => {
-    const res = await fetch(`${base_url}/at-home/server/${chapterId}`);
-    const data = await res.json();
-    return data.chapter.data.map((file) => `$https://uploads.mangadex.org/data/${data.chapter.hash}/${file}`);
+    if (chapterCache.has(chapterId)) {
+        const cached = chapterCache.get(chapterId);
+        if (Date.now() - cached.timestamp < CACHE_TTL) {
+            return cached.data;
+        } else {
+            chapterCache.delete(chapterId);
+        }
+    }
+
+    try {
+        const res = await fetchWithRetry(`${base_url}/at-home/server/${chapterId}`);
+        if (!res.ok) {
+            throw new Error(`MangaDex API Error: ${res.status} ${res.statusText}`);
+        }
+        
+        const data = await res.json();
+        if (!data || !data.chapter || !data.chapter.data) {
+             throw new Error("Invalid response structure from MangaDex @Home API");
+        }
+        
+        const pages = data.chapter.data.map((file) => `${data.baseUrl}/data/${data.chapter.hash}/${file}`);
+        
+        chapterCache.set(chapterId, {
+            timestamp: Date.now(),
+            data: pages
+        });
+        
+        return pages;
+    } catch (error) {
+        console.error(`Error fetching pages for chapter ${chapterId}:`, error.message);
+        throw error;
+    }
 };
 
 const getMangaById = async (mangaId) => {
