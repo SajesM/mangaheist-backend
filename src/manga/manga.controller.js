@@ -38,24 +38,10 @@ const getChapters = async (req, res) => {
 };
 
 const getPages = async (req, res) => {
-  try {
-    const data = await mangaService.getMangaPages(req.params.chapterId);
-
-    if (!data || !Array.isArray(data)) {
-      return res.status(500).json({
-        message: "Invalid pages response from service"
-      });
-    }
-
-    res.json(data);
-  } catch (error) {
-    console.error("getPages error:", error.message);
-
-    res.status(500).json({
-      message: "Failed to fetch pages",
-      error: error.message
-    });
-  }
+    try {
+        const data = await mangaService.getMangaPages(req.params.chapterId);
+        res.json(data);
+    } catch (error) { res.status(500).json({ message: error.message }); }
 };
 
 const getManga = async (req, res) => {

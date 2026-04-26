@@ -47,35 +47,10 @@ const getMangaChapters = async (mangaId) => {
     return res.json();
 };
 
-const getMangaPages = async (chapterId, retry = 2) => {
-  try {
-    const res = await fetch(
-      `https://api.mangadex.org/at-home/server/${chapterId}`
-    );
-
+const getMangaPages = async (chapterId) => {
+    const res = await fetch(`${base_url}/at-home/server/${chapterId}`);
     const data = await res.json();
-
-    if (!data?.chapter?.hash || !data?.baseUrl) {
-      throw new Error("Invalid MangaDex response");
-    }
-
-    const base = data.baseUrl;
-    const hash = data.chapter.hash;
-
-    return data.chapter.data.map(
-      (file) => `${base}/data/${hash}/${file}`
-    );
-
-  } catch (err) {
-    console.log("MangaDex failed:", err.message);
-
-    if (retry > 0) {
-      console.log("Retrying MangaDex...", retry);
-      return getMangaPages(chapterId, retry - 1);
-    }
-
-    throw new Error("Failed after retries");
-  }
+    return data.chapter.data.map((file) => `${data.baseUrl}/data/${data.chapter.hash}/${file}`);
 };
 
 const getMangaById = async (mangaId) => {
