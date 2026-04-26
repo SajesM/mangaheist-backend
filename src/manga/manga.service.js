@@ -39,31 +39,36 @@ const cleanMangaData = (mangaList) => {
 };
 
 const getTrending = async () => {
-    const response = await fetch(`${base_url}/manga?includes[]=cover_art&order[followedCount]=desc&limit=20&contentRating[]=safe&contentRating[]=suggestive`);
+    const response = await fetchWithRetry(`${base_url}/manga?includes[]=cover_art&order[followedCount]=desc&limit=20&contentRating[]=safe&contentRating[]=suggestive`);
+    if (!response.ok) return [];
     const data = await response.json();
     return cleanMangaData(data.data);
 };
 
 const getListOfManga = async (limit) => {
-    const res = await fetch(`${base_url}/manga?limit=${limit}&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`);
+    const res = await fetchWithRetry(`${base_url}/manga?limit=${limit}&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`);
+    if (!res.ok) return [];
     const data = await res.json();
     return cleanMangaData(data.data);
 };
 
 const getLatestManga = async () => {
-    const res = await fetch(`${base_url}/manga?limit=20&order[createdAt]=desc&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`);
+    const res = await fetchWithRetry(`${base_url}/manga?limit=20&order[createdAt]=desc&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`);
+    if (!res.ok) return [];
     const data = await res.json();
     return cleanMangaData(data.data);
 };
 
 const searchManga = async (title) => {
-    const res = await fetch(`${base_url}/manga?title=${encodeURIComponent(title)}&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`);
+    const res = await fetchWithRetry(`${base_url}/manga?title=${encodeURIComponent(title)}&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`);
+    if (!res.ok) return [];
     const data = await res.json();
     return cleanMangaData(data.data);
 };
 
 const getMangaChapters = async (mangaId) => {
-    const res = await fetch(`${base_url}/chapter?manga=${mangaId}`);
+    const res = await fetchWithRetry(`${base_url}/chapter?manga=${mangaId}&limit=100&order[chapter]=asc`);
+    if (!res.ok) return { data: [] };
     return res.json();
 };
 
@@ -82,19 +87,22 @@ const getMangaPages = async (chapterId) => {
         if (!res.ok) {
             throw new Error(`MangaDex API Error: ${res.status} ${res.statusText}`);
         }
-        
+
         const data = await res.json();
         if (!data || !data.chapter || !data.chapter.data) {
-             throw new Error("Invalid response structure from MangaDex @Home API");
+            throw new Error("Invalid response structure from MangaDex @Home API");
         }
-        
-        const pages = data.chapter.data.map((file) => `${data.baseUrl}/data/${data.chapter.hash}/${file}`);
-        
+
+        const pages = data.chapter.data.map((file) => ({
+            hash: data.chapter.hash,
+            file: file
+        }));
+
         chapterCache.set(chapterId, {
             timestamp: Date.now(),
             data: pages
         });
-        
+
         return pages;
     } catch (error) {
         console.error(`Error fetching pages for chapter ${chapterId}:`, error.message);
@@ -103,8 +111,10 @@ const getMangaPages = async (chapterId) => {
 };
 
 const getMangaById = async (mangaId) => {
-    const res = await fetch(`${base_url}/manga/${mangaId}?includes[]=cover_art`);
+    const res = await fetchWithRetry(`${base_url}/manga/${mangaId}?includes[]=cover_art`);
+    if (!res.ok) throw new Error("Failed to fetch manga");
     const data = await res.json();
+    if (!data.data) return null;
     return cleanMangaData([data.data])[0];
 };
 
